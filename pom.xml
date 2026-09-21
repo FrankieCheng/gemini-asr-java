@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>com.example.speech</groupId>
+    <artifactId>gemini-chirp3-transcribe-demos</artifactId>
+    <version>1.0.0</version>
+    <packaging>jar</packaging>
+
+    <name>Gemini 3.5 Transcribe &amp; Chirp 3 Java Demos</name>
+    <description>
+        Java equivalents of gemini_3_5_transcribe.ipynb (gemini-3.5-transcribe-preview and
+        gemini-3.5-transcribe-live-preview) and get_started_with_chirp_3_transcription.ipynb (chirp_3).
+    </description>
+
+    <properties>
+        <maven.compiler.source>17</maven.compiler.source>
+        <maven.compiler.target>17</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <google.genai.version>1.72.0</google.genai.version>
+        <google.cloud.speech.version>4.92.0</google.cloud.speech.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>com.google.auth</groupId>
+            <artifactId>google-auth-library-oauth2-http</artifactId>
+            <version>1.52.0</version>
+        </dependency>
+        <dependency>
+            <groupId>com.google.auth</groupId>
+            <artifactId>google-auth-library-credentials</artifactId>
+            <version>1.52.0</version>
+        </dependency>
+
+        <!-- Google Cloud Speech-to-Text V2 SDK for Java (chirp_3) -->
+        <dependency>
+            <groupId>com.google.cloud</groupId>
+            <artifactId>google-cloud-speech</artifactId>
+            <version>${google.cloud.speech.version}</version>
+        </dependency>
+
+        <!-- Google Gen AI SDK for Java (gemini-3.5-transcribe-preview & gemini-3.5-transcribe-live-preview) -->
+        <dependency>
+            <groupId>com.google.genai</groupId>
+            <artifactId>google-genai</artifactId>
+            <version>${google.genai.version}</version>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.11.0</version>
+                <configuration>
+                    <release>17</release>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.codehaus.mojo</groupId>
+                <artifactId>exec-maven-plugin</artifactId>
+                <version>3.1.0</version>
+            </plugin>
+        </plugins>
+    </build>
+</project>

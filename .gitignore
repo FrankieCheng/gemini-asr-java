@@ -1,0 +1,8 @@
+target/
+*.wav
+*.mp3
+*.webm
+*.json
+.DS_Store
+.idea/
+*.iml
