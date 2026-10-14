@@ -76,7 +76,7 @@ import javax.sound.sampled.TargetDataLine;
  *       <li>Transcribing long audio files (batch up to 1 hour)</li>
  *     </ol>
  *   </li>
- *   <li><b>Streaming ({@code gemini-3.5-transcribe-live-preview})</b> via {@code client.async.live.connect}:
+ *   <li><b>Streaming ({@code gemini-3.5-transcribe-live})</b> via {@code client.async.live.connect}:
  *     <ol>
  *       <li>Streaming transcription with automatic language recognition</li>
  *       <li>Streaming transcription using language codes</li>
@@ -90,7 +90,8 @@ import javax.sound.sampled.TargetDataLine;
 public class Gemini35TranscribeDemo implements AutoCloseable {
 
   public static final String MODEL_ID = "gemini-3.5-transcribe-preview";
-  public static final String MODEL_ID_LIVE = "gemini-3.5-transcribe-live-preview";
+  public static final String MODEL_ID_LIVE =
+      System.getProperty("model", "gemini-3.5-transcribe-live");
 
   private static final Set<String> ALLOWED_SAMPLE_HOSTS =
       Set.of("storage.googleapis.com");
@@ -304,7 +305,7 @@ public class Gemini35TranscribeDemo implements AutoCloseable {
   }
 
   // =========================================================================
-  // 2. STREAMING TRANSCRIPTION (gemini-3.5-transcribe-live-preview)
+  // 2. STREAMING TRANSCRIPTION (gemini-3.5-transcribe-live)
   // =========================================================================
 
   /**
@@ -373,6 +374,10 @@ public class Gemini35TranscribeDemo implements AutoCloseable {
    */
   public void handleStreamingMessage(
       LiveServerMessage message, List<String> transcriptBuffer) {
+    // Optionally dump every raw server message (set LIVE_DEBUG=true)
+    if (Boolean.parseBoolean(System.getenv().getOrDefault("LIVE_DEBUG", "false"))) {
+      System.out.println("\n[Raw LiveServerMessage] " + message.toJson());
+    }
     if (message.serverContent().isEmpty()) {
       return;
     }
@@ -406,7 +411,7 @@ public class Gemini35TranscribeDemo implements AutoCloseable {
   }
 
   /**
-   * Opens a Live session with {@code gemini-3.5-transcribe-live-preview}, verifies
+   * Opens a Live session with {@code gemini-3.5-transcribe-live}, verifies
    * {@code setupComplete}, streams the audio file, and collects the transcript.
    */
   public String streamingMain(Path audioFile, LiveConnectConfig config) throws Exception {
@@ -692,7 +697,7 @@ public class Gemini35TranscribeDemo implements AutoCloseable {
       demo.transcribeWithSpeakerDiarization(hobbiesWav);
       demo.transcribeWithCustomVocabulary(coffeeWav);
 
-      // 3. Run Streaming Examples (gemini-3.5-transcribe-live-preview)
+      // 3. Run Streaming Examples (gemini-3.5-transcribe-live)
       demo.streamAutomaticLanguageRecognition(storyWav);
       demo.streamWithLanguageCodes(koreanEnglishWav);
       demo.streamWithCustomVocabulary(coffeeWav);

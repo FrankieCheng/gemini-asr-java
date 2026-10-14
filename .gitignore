@@ -1,8 +1,15 @@
 target/
 *.wav
 *.mp3
+*.mp4
 *.webm
 *.json
 .DS_Store
 .idea/
 *.iml
+logs/
+test_data/
+scripts/
+
+# Service account keys
+*sa-key*.json
