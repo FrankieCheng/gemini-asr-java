@@ -17,10 +17,16 @@ package com.example.speech.live;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.google.genai.types.AudioTranscriptionConfig;
+import com.google.genai.types.AutomaticActivityDetection;
+import com.google.genai.types.EndSensitivity;
+import com.google.genai.types.RealtimeInputConfig;
+import com.google.genai.types.StartSensitivity;
 import java.util.Base64;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import okhttp3.OkHttpClient;
 import okhttp3.Request;
@@ -30,13 +36,45 @@ import okhttp3.WebSocketListener;
 import okio.ByteString;
 
 /**
- * 单个 Live WebSocket 会话（直接走 Vertex AI BidiGenerateContent 协议，不经过 google-genai SDK）。
- *
- * <p>为什么不用 SDK：SDK 1.72.0 (1) 不支持 {@code realtimeInputConfig.interimTranscriptTimestampEnabled}；
- * (2) 会话建立后服务端关闭连接时不通知业务代码，{@code sendRealtimeInput()} 也不报错，音频被静默丢弃。
- * 直接使用 WebSocket 可以拿到关闭帧和发送失败，从而做断线恢复。
+ * 单个 Live WebSocket 会话：优先复用官方 {@code com.google.genai.types} 强类型配置模型序列化，
+ * 仅在底层 WebSocket 通道做薄封装以补齐 {@code google-genai:1.72.0} 缺失的断连检测与中间时间戳开关。
  */
 final class LiveWsSession {
+
+  /** 对齐官方 Python {@code _gemini_stt.py._TRANSIENT_CLOSE_CODES}。 */
+  static final Set<Integer> TRANSIENT_CLOSE_CODES =
+      Set.of(1000, 1001, 1006, 1011, 1012, 1013, 1014);
+
+  /** 对齐官方 Python {@code _gemini_stt.py._TRANSIENT_STATUS_CODES}。 */
+  static final Set<Integer> TRANSIENT_HTTP_CODES = Set.of(408, 429, 500, 502, 503, 504);
+
+  /** 建连握手异常，携带 WebSocket close code 与 HTTP 状态码供上层判断是否属于可重试瞬态故障。 */
+  static final class ConnectFailureException extends IllegalStateException {
+    final int closeCode;
+    final int httpStatus;
+
+    ConnectFailureException(String message, int closeCode, int httpStatus) {
+      super(message);
+      this.closeCode = closeCode;
+      this.httpStatus = httpStatus;
+    }
+
+    boolean isTransient() {
+      return isTransientCode(closeCode, httpStatus);
+    }
+  }
+
+  /** 对标官方 Python {@code _gemini_stt.py._is_transient}：判定关闭码或 HTTP 状态码是否属于可恢复瞬态错误。 */
+  static boolean isTransientCode(int wsCloseCode, int httpStatus) {
+    if (httpStatus > 0) {
+      return TRANSIENT_HTTP_CODES.contains(httpStatus);
+    }
+    if (wsCloseCode > 0) {
+      return TRANSIENT_CLOSE_CODES.contains(wsCloseCode);
+    }
+    // 无 HTTP 状态码且无标准 close 帧（如底层 TCP 重置 / IO 超时），对应 _gemini_stt.py 视为 1006 / ConnectionError
+    return true;
+  }
 
   /** 会话事件回调（在 OkHttp 线程上调用）。 */
   interface Callback {
@@ -45,12 +83,30 @@ final class LiveWsSession {
     /** offset 为会话内相对时间（毫秒），未知为 -1。 */
     void onInterim(LiveWsSession s, String text, long startOffsetMs, long endOffsetMs);
 
+    default void onInterim(
+        LiveWsSession s, String text, long startOffsetMs, long endOffsetMs, String rawJson) {
+      onInterim(s, text, startOffsetMs, endOffsetMs);
+    }
+
     void onFinal(LiveWsSession s, String text);
+
+    default void onFinal(LiveWsSession s, String text, String rawJson) {
+      onFinal(s, text);
+    }
 
     void onGoAway(LiveWsSession s, long timeLeftMs);
 
     /** 连接结束。{@code initiatedByClient=false} 表示服务端关闭或网络故障。 */
     void onClosed(LiveWsSession s, boolean initiatedByClient, String reason);
+
+    /** 收到任意服务端消息（用于对标官方 Python _gemini_stt.py 的 message_received 事件）。 */
+    default void onServerMessage(LiveWsSession s) {}
+
+    /** 服务端 VAD 状态变化（ACTIVITY_START=true, ACTIVITY_END=false）。 */
+    default void onVoiceActivity(LiveWsSession s, boolean active) {}
+
+    /** 服务端确认当前话轮结束（generationComplete=true，无论是否包含有效词）。 */
+    default void onGenerationComplete(LiveWsSession s) {}
   }
 
   private static final ObjectMapper JSON = new ObjectMapper();
@@ -63,6 +119,8 @@ final class LiveWsSession {
   private volatile boolean clientClosing = false;
   private volatile boolean dead = false;
   private volatile boolean closedNotified = false;
+  private volatile int lastCloseCode = -1;
+  private volatile int lastHttpStatus = -1;
 
   private LiveWsSession(
       int index, OkHttpClient http, LiveTranscriptionConfig cfg, String accessToken, Callback cb) {
@@ -91,6 +149,12 @@ final class LiveWsSession {
     LiveWsSession s = new LiveWsSession(index, http, cfg, accessToken, cb);
     try {
       s.setupComplete.get(cfg.connectTimeoutMs, TimeUnit.MILLISECONDS);
+    } catch (ExecutionException e) {
+      s.ws.cancel();
+      if (e.getCause() instanceof Exception cause) {
+        throw cause;
+      }
+      throw e;
     } catch (Exception e) {
       s.ws.cancel();
       throw e;
@@ -98,23 +162,78 @@ final class LiveWsSession {
     return s;
   }
 
+  /**
+   * 优先使用官方 {@code com.google.genai.types}（{@link AudioTranscriptionConfig}、
+   * {@link AutomaticActivityDetection}、{@link RealtimeInputConfig}）构建并序列化协议 JSON，
+   * 仅对 SDK 1.72.0 尚未暴露的 {@code interimTranscriptTimestampEnabled} 布尔位做增量补充。
+   */
   static String buildSetup(LiveTranscriptionConfig cfg) {
-    ObjectNode root = JSON.createObjectNode();
-    ObjectNode setup = root.putObject("setup");
-    setup.put(
-        "model",
-        "projects/" + cfg.project + "/locations/" + cfg.location + "/publishers/google/models/"
-            + cfg.model);
-    setup.putObject("generationConfig").putArray("responseModalities").add("TEXT");
-    ObjectNode iat = setup.putObject("inputAudioTranscription");
-    if (!cfg.languageCodes.isEmpty()) {
-      ArrayNode langs = iat.putArray("languageCodes");
-      cfg.languageCodes.forEach(langs::add);
+    try {
+      ObjectNode root = JSON.createObjectNode();
+      ObjectNode setup = root.putObject("setup");
+      setup.put(
+          "model",
+          "projects/" + cfg.project + "/locations/" + cfg.location + "/publishers/google/models/"
+              + cfg.model);
+      setup.putObject("generationConfig").putArray("responseModalities").add("TEXT");
+
+      AudioTranscriptionConfig.Builder iatBuilder = AudioTranscriptionConfig.builder();
+      if (!cfg.languageCodes.isEmpty()) {
+        iatBuilder.languageCodes(cfg.languageCodes);
+      }
+      if (!cfg.customVocabulary.isEmpty()) {
+        iatBuilder.customVocabulary(cfg.customVocabulary);
+      }
+      setup.set("inputAudioTranscription", JSON.readTree(iatBuilder.build().toJson()));
+
+      boolean hasAad =
+          cfg.manualVad
+              || cfg.silenceDurationMs > 0
+              || cfg.prefixPaddingMs >= 0
+              || cfg.startOfSpeechSensitivity.wireValue != null
+              || cfg.endOfSpeechSensitivity.wireValue != null;
+      if (cfg.interimTimestamps || hasAad) {
+        ObjectNode ric;
+        if (hasAad) {
+          AutomaticActivityDetection.Builder aadBuilder = AutomaticActivityDetection.builder();
+          if (cfg.manualVad) {
+            aadBuilder.disabled(true);
+          } else {
+            if (cfg.startOfSpeechSensitivity.wireValue != null) {
+              aadBuilder.startOfSpeechSensitivity(
+                  new StartSensitivity(cfg.startOfSpeechSensitivity.wireValue));
+            }
+            if (cfg.endOfSpeechSensitivity.wireValue != null) {
+              aadBuilder.endOfSpeechSensitivity(
+                  new EndSensitivity(cfg.endOfSpeechSensitivity.wireValue));
+            }
+            if (cfg.prefixPaddingMs >= 0) {
+              aadBuilder.prefixPaddingMs(cfg.prefixPaddingMs);
+            }
+            if (cfg.silenceDurationMs > 0) {
+              aadBuilder.silenceDurationMs(cfg.silenceDurationMs);
+            }
+          }
+          RealtimeInputConfig sdkRic =
+              RealtimeInputConfig.builder()
+                  .automaticActivityDetection(aadBuilder.build())
+                  .build();
+          ric = (ObjectNode) JSON.readTree(sdkRic.toJson());
+        } else {
+          ric = JSON.createObjectNode();
+        }
+        if (cfg.interimTimestamps) {
+          ObjectNode orderedRic = JSON.createObjectNode();
+          orderedRic.put("interimTranscriptTimestampEnabled", true);
+          orderedRic.setAll(ric);
+          ric = orderedRic;
+        }
+        setup.set("realtimeInputConfig", ric);
+      }
+      return root.toString();
+    } catch (java.io.IOException e) {
+      throw new IllegalStateException("序列化 Live setup 配置失败", e);
     }
-    if (cfg.interimTimestamps) {
-      setup.putObject("realtimeInputConfig").put("interimTranscriptTimestampEnabled", true);
-    }
-    return root.toString();
   }
 
   boolean isDead() {
@@ -140,6 +259,40 @@ final class LiveWsSession {
     return !dead && ws.send("{\"realtimeInput\":{\"audioStreamEnd\":true}}");
   }
 
+  boolean sendActivityStart() {
+    return !dead && ws.send("{\"realtimeInput\":{\"activityStart\":{}}}");
+  }
+
+  boolean sendActivityEnd() {
+    return !dead && ws.send("{\"realtimeInput\":{\"activityEnd\":{}}}");
+  }
+
+  /**
+   * 对应官方 Python {@code _gemini_stt.py._flush}：发送 {@code durationMs} 毫秒的全零 PCM 静音帧，
+   * 确保服务端流式 Tokenizer 即使尚未处理到最后一帧语音（因而忽略了 {@code audioStreamEnd}），
+   * 也能被紧随其后的静音帧正常触发 EOS 落定 Final。
+   */
+  boolean sendSilence(long durationMs) {
+    if (dead || durationMs <= 0) {
+      return !dead;
+    }
+    int frameBytes = LiveTranscriptionConfig.SAMPLE_RATE * 2 * 100 / 1000; // 100ms = 3200B
+    byte[] zeroFrame = new byte[frameBytes];
+    long remainingMs = durationMs;
+    while (remainingMs > 0 && !dead) {
+      long chunkMs = Math.min(100, remainingMs);
+      byte[] chunk =
+          chunkMs == 100
+              ? zeroFrame
+              : new byte[(int) (LiveTranscriptionConfig.SAMPLE_RATE * 2 * chunkMs / 1000)];
+      if (!sendAudio(chunk)) {
+        return false;
+      }
+      remainingMs -= chunkMs;
+    }
+    return true;
+  }
+
   /** 客户端主动正常关闭。 */
   void close() {
     clientClosing = true;
@@ -151,11 +304,26 @@ final class LiveWsSession {
     ws.cancel();
   }
 
+  boolean isTransientFailure() {
+    return isTransientCode(lastCloseCode, lastHttpStatus);
+  }
+
   private void markDead(String reason) {
+    markDead(reason, 1006, -1);
+  }
+
+  private void markDead(String reason, int closeCode, int httpStatus) {
+    if (closeCode > 0) {
+      this.lastCloseCode = closeCode;
+    }
+    if (httpStatus > 0) {
+      this.lastHttpStatus = httpStatus;
+    }
     dead = true;
     if (!closedNotified) {
       closedNotified = true;
-      setupComplete.completeExceptionally(new IllegalStateException(reason));
+      setupComplete.completeExceptionally(
+          new ConnectFailureException(reason, this.lastCloseCode, this.lastHttpStatus));
       callback.onClosed(this, clientClosing, reason);
     }
   }
@@ -202,6 +370,7 @@ final class LiveWsSession {
     } catch (Exception e) {
       return;
     }
+    callback.onServerMessage(this);
     if (root.has("setupComplete")) {
       setupComplete.complete(null);
       callback.onSetupComplete(this);
@@ -210,16 +379,32 @@ final class LiveWsSession {
     if (goAway != null) {
       callback.onGoAway(this, parseDurationMs(goAway.get("timeLeft")));
     }
+    JsonNode va = root.get("voiceActivity");
+    if (va != null && va.hasNonNull("voiceActivityType")) {
+      String type = va.get("voiceActivityType").asText();
+      if ("ACTIVITY_START".equals(type) || "VOICE_ACTIVITY_TYPE_START".equals(type)) {
+        callback.onVoiceActivity(this, true);
+      } else if ("ACTIVITY_END".equals(type) || "VOICE_ACTIVITY_TYPE_END".equals(type)) {
+        callback.onVoiceActivity(this, false);
+      }
+    }
     JsonNode sc = root.get("serverContent");
     if (sc != null) {
       JsonNode interim = sc.get("interimInputTranscription");
       if (interim != null && interim.hasNonNull("text")) {
-        callback.onInterim(this, interim.get("text").asText(),
-            parseDurationMs(interim.get("startOffset")), parseDurationMs(interim.get("endOffset")));
+        callback.onInterim(
+            this,
+            interim.get("text").asText(),
+            parseDurationMs(interim.get("startOffset")),
+            parseDurationMs(interim.get("endOffset")),
+            text);
       }
       JsonNode fin = sc.get("inputTranscription");
       if (fin != null && fin.hasNonNull("text") && !fin.get("text").asText().isBlank()) {
-        callback.onFinal(this, fin.get("text").asText().trim());
+        callback.onFinal(this, fin.get("text").asText().trim(), text);
+      }
+      if (sc.path("generationComplete").asBoolean(false)) {
+        callback.onGenerationComplete(this);
       }
     }
   }
@@ -249,17 +434,18 @@ final class LiveWsSession {
     @Override
     public void onClosing(WebSocket webSocket, int code, String reason) {
       webSocket.close(1000, null);
-      markDead("closing code=" + code + " reason=" + reason);
+      markDead("closing code=" + code + " reason=" + reason, code, -1);
     }
 
     @Override
     public void onClosed(WebSocket webSocket, int code, String reason) {
-      markDead("closed code=" + code + " reason=" + reason);
+      markDead("closed code=" + code + " reason=" + reason, code, -1);
     }
 
     @Override
     public void onFailure(WebSocket webSocket, Throwable t, Response response) {
-      markDead("failure " + t + (response != null ? " http=" + response.code() : ""));
+      int httpCode = response != null ? response.code() : -1;
+      markDead("failure " + t + (httpCode > 0 ? " http=" + httpCode : ""), 1006, httpCode);
     }
   }
 }

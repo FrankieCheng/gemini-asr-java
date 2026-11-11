@@ -33,8 +33,10 @@ public final class TranscriptEvent {
 
   /** FINAL 的来源。 */
   public enum Source {
-    /** 服务端返回的 inputTranscription。 */
+    /** 服务端 Configurable Endpointing 原生自然断句返回的 inputTranscription。 */
     SERVER,
+    /** 客户端软刷安全阀（audioStreamEnd）触发后服务端返回的 inputTranscription。 */
+    SOFT_FLUSH,
     /** 会话收尾时服务端未落定，用累计 interim 兜底。 */
     INTERIM_FALLBACK
   }
@@ -45,18 +47,31 @@ public final class TranscriptEvent {
   public final long startMs;
   public final long endMs;
   public final int sessionIndex;
+  public final String rawJson;
 
   TranscriptEvent(Type type, Source source, String text, long startMs, long endMs, int sessionIndex) {
+    this(type, source, text, startMs, endMs, sessionIndex, null);
+  }
+
+  TranscriptEvent(
+      Type type,
+      Source source,
+      String text,
+      long startMs,
+      long endMs,
+      int sessionIndex,
+      String rawJson) {
     this.type = type;
     this.source = source;
     this.text = text;
     this.startMs = startMs;
     this.endMs = endMs;
     this.sessionIndex = sessionIndex;
+    this.rawJson = rawJson;
   }
 
   TranscriptEvent withText(String newText) {
-    return new TranscriptEvent(type, source, newText, startMs, endMs, sessionIndex);
+    return new TranscriptEvent(type, source, newText, startMs, endMs, sessionIndex, rawJson);
   }
 
   @Override
