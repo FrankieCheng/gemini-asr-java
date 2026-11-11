@@ -85,21 +85,32 @@ public final class LiveSelfTest {
     check("duration 30s", String.valueOf(LiveWsSession.parseDurationMs(m.readTree("\"30s\""))),
         "30000");
 
-    // setup JSON — 默认带 interimTranscriptTimestampEnabled 与官方 Python 默认 silenceDurationMs=500
+    // setup JSON — 默认启用 UnifiedAdaptive（manualVad=true + 实时 SNR 双档动态定稿）
     LiveTranscriptionConfig defaultCfg = LiveTranscriptionConfig.builder().project("p").build();
     String setup = LiveWsSession.buildSetup(defaultCfg);
     check("setup has interim ts", String.valueOf(setup.contains(
         "\"interimTranscriptTimestampEnabled\":true")), "true");
-    check("setup default silence 500ms", String.valueOf(setup.contains(
-        "\"automaticActivityDetection\":{\"silenceDurationMs\":500}")), "true");
+    check("default unifiedAdaptive=true", String.valueOf(defaultCfg.unifiedAdaptive), "true");
+    check("default manualVad=true", String.valueOf(defaultCfg.manualVad), "true");
+    check("default flushAfterMs=15000", String.valueOf(defaultCfg.flushAfterMs), "15000");
+    check("setup default disabled=true", String.valueOf(setup.contains(
+        "\"automaticActivityDetection\":{\"disabled\":true}")), "true");
     check("setup model path", String.valueOf(setup.contains(
         "projects/p/locations/global/publishers/google/models/gemini-3.5-transcribe-live")), "true");
     check("default tailReplayMs=500", String.valueOf(defaultCfg.effectiveTailReplayMs()), "500");
+
+    // 显式开启 Auto-VAD（methodCOfficialFirst）时带 silenceDurationMs=500
+    LiveTranscriptionConfig methodCCfg =
+        LiveTranscriptionConfig.builder().project("p").methodCOfficialFirst().build();
+    String methodCSetup = LiveWsSession.buildSetup(methodCCfg);
+    check("setup MethodC silence 500ms", String.valueOf(methodCSetup.contains(
+        "\"automaticActivityDetection\":{\"silenceDurationMs\":500}")), "true");
 
     // Configurable Endpointing + customVocabulary (对标 test_gemini_stt.py)
     LiveTranscriptionConfig customEpCfg =
         LiveTranscriptionConfig.builder()
             .project("p")
+            .methodCOfficialFirst()
             .languageCodes(java.util.List.of("en-US"))
             .customVocabulary(java.util.List.of("ADK", "Cymbal Direct"))
             .startOfSpeechSensitivity(LiveTranscriptionConfig.StartSensitivity.HIGH)
@@ -132,10 +143,10 @@ public final class LiveSelfTest {
     check("farField stallMs 90s", String.valueOf(farFieldCfg.stallMs), "90000");
     check("farField maxReplayMs 60s", String.valueOf(farFieldCfg.maxReplayMs), "60000");
 
-    // Method C 默认参数与官方瞬态错误分类（对标 _gemini_stt.py _is_transient）
-    check("Method C officialFirst default", String.valueOf(defaultCfg.officialFirst), "true");
-    check("Method C flushAfterMs 24s", String.valueOf(defaultCfg.flushAfterMs), "24000");
-    check("Method C preferServerCut 12s", String.valueOf(defaultCfg.preferServerCutoverMs), "12000");
+    // Method C 参数与官方瞬态错误分类（对标 _gemini_stt.py _is_transient）
+    check("Method C officialFirst", String.valueOf(methodCCfg.officialFirst), "true");
+    check("Method C flushAfterMs 24s", String.valueOf(methodCCfg.flushAfterMs), "24000");
+    check("Method C preferServerCut 12s", String.valueOf(methodCCfg.preferServerCutoverMs), "12000");
     LiveTranscriptionConfig legacyB =
         LiveTranscriptionConfig.builder().project("p").legacyMethodB().build();
     check("Method B officialFirst=false", String.valueOf(legacyB.officialFirst), "false");
@@ -146,7 +157,7 @@ public final class LiveSelfTest {
     check("transient http 503", String.valueOf(LiveWsSession.isTransientCode(-1, 503)), "true");
     check("non-transient http 403", String.valueOf(LiveWsSession.isTransientCode(-1, 403)), "false");
 
-    // 未知近场/远场三大方案预设校验
+    // 未知近场/远场预设校验
     LiveTranscriptionConfig u15 =
         LiveTranscriptionConfig.builder().project("p").universalFarField15s().build();
     check("Plan1 manualVad=true", String.valueOf(u15.manualVad), "true");

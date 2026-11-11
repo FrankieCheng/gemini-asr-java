@@ -51,21 +51,19 @@ mvn exec:java -Dexec.mainClass="com.example.speech.Chirp3TranscribeDemo"
 - [`docs/GEMINI_35_LIVE_OFFICIAL_REFERENCE_AND_ENHANCEMENT.md`](docs/GEMINI_35_LIVE_OFFICIAL_REFERENCE_AND_ENHANCEMENT.md)（10 分钟官方标注溯源、官方 GitHub Python 参考实现原理/局限性拆解、以及混合增强方案 Method C 设计详解）
 - [`docs/GEMINI_LIVE_LONG_AUDIO_GUIDE.md`](docs/GEMINI_LIVE_LONG_AUDIO_GUIDE.md)（原生 WebSocket 抓包分析与长语音全量基准评测报告）
 
-默认启用 **✨ Method C（官方 ADK 优先 + `Make-Before-Break` 兜底护栏，`methodCOfficialFirst()`）**：
-- **100% 复用官方 `google-genai` SDK 类型建模 Setup**：通过 `AudioTranscriptionConfig` / `AutomaticActivityDetection` / `RealtimeInputConfig` 序列化，原生支持 `startOfSpeechSensitivity`、`endOfSpeechSensitivity`（`DEFAULT` / `HIGH` / `LOW`）、`silenceDurationMs`（默认 `500ms`）、`prefixPaddingMs` 与 `customVocabulary`；
-- **服务端原生断句主导 + `24s` 安全阀**：日常 `<24s` 对话 **0 客户端干预（100% `SERVER` 原生整句与标点）**，仅在超长紧凑独白时触发微停顿软刷防积压；
-- **两段式零盲区轮换**：后台提前建连预热（`0ms` 握手空窗），`12s` 窗口内严格优先等官方 `!pending` 句末零排空切流（`official_gap`），超时或 `GoAway` 逼近时自动降级声学静音/重叠切流 + `dropOverlap` 词级消重；
-- **官方瞬态错误白名单 + `60s` 环形缓冲重放**：精确对齐 `_gemini_stt.py` 瞬态码（`1008`/`403` 快速失败），句中闪断 100% 找回未落定语音。
+默认启用 **🌟 统一全场景自适应模式（`unifiedAdaptiveMode()`，零配置通吃近场/远场与超 10 分钟长流）**：
+- **底层全拾音防吞字（`manualVad = true`）**：关闭在远场混响下易吞掉句首的服务端自动断句，同一场会议内近场/远场说话人交替也无需断开重建 WebSocket；
+- **10s 滑动窗实时 SNR 双档动态定稿**：
+  - **⚡ 近场高信噪比档**（`P80 >= 1350 && SNR >= 4.5x`）：说话满 `3.5s` 且遇到 `>=600ms` 自然句间停顿即刻输出 `Final`（首句 `3.84s` 即定稿，平均 `6.7s` 一句），连续快语速满 `15s` 微停顿兜底；
+  - **🛡️ 远场低信噪比抗噪档**（`P80 < 1350 || SNR < 4.5x`）：自动屏蔽混响造成的假停顿，攒满 `15s` 上下文或遇到 `>=1.8s` 话轮交替停顿输出高精度 `Final`；
+- **两段式零盲区轮换 + `60s` 环形缓冲重放**：满 8 分钟后台提前建连预热（`0ms` 握手空窗），配合中/英/东南亚语种词级与字符级消重，支持无限时长连续推流。
 
 ```java
 LiveTranscriptionConfig cfg = LiveTranscriptionConfig.builder()
     .project("my-project")
     .location("global")
-    .methodCOfficialFirst() // 默认已开启：officialFirst=true, preferServerCutoverMs=12s, flushAfterMs=24s, maxReplayMs=60s
-    .silenceDurationMs(500)
-    .startOfSpeechSensitivity(LiveTranscriptionConfig.StartSensitivity.DEFAULT)
-    .endOfSpeechSensitivity(LiveTranscriptionConfig.EndSensitivity.DEFAULT)
-    .build();
+    .languageCodes(List.of("cmn-CN", "en-US")) // 可选：推荐显式传入语种
+    .build(); // 默认已开启 unifiedAdaptiveMode()：零配置自动适配近场、远场与远近交替场景
 
 try (RotatingLiveTranscriber t = new RotatingLiveTranscriber(cfg, new TranscriptListener() {
       @Override public void onInterim(TranscriptEvent e) { /* 实时字幕预览 */ }

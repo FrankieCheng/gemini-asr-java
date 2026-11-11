@@ -537,10 +537,31 @@ public final class RotatingLiveTranscriber implements AutoCloseable {
             }
           }
 
-          // 2.5) 会话内定期落定安全阀：
+          // 2.5) 会话内定期落定与统一自适应定稿（unifiedAdaptive）：
+          // - 统一自适应模式（unifiedAdaptive=true, manualVad=true）：
+          //   实时根据最近 10s 滑动窗口的 P80 与 SNR(P80/P10) 自动分档：
+          //   * ⚡ 近场高信噪比档 (P80>=1350 && SNR>=4.5x)：已说 >=3.5s 且出现 >=600ms 自然停顿立即出 Final；或满 15s 微停顿兜底；
+          //   * 🛡️ 远场低信噪比抗噪档 (P80<1350 || SNR<4.5x)：满 15s 且出现 >=250ms 微停顿出 Final；或已说 >=6.0s 且出现 >=1.8s 话轮长停顿出 Final。
           // - 自动 VAD（Method C 默认 24s）：日常断句交由服务端，超 24s 趁微停顿发 audioStreamEnd 破除死锁；
-          // - 远场手动 VAD（farFieldMode 默认 45s）：趁微停顿发 activityEnd 落盘整段长上下文，避开服务端 220s 单话轮硬上限
-          //   且确保未落定音频始终小于 60s 环形重放缓冲（若后台已在预热新会话则直接交由跨会话切流收尾）。
+          // - 远场手动 VAD（farFieldMode 默认 45s）：趁微停顿发 activityEnd 落盘整段长上下文。
+          if (cfg.unifiedAdaptive && levelCount >= 30 && levelCount % 10 == 0) {
+            boolean nearNow = isNearFieldCleanWindow();
+            if (lastLoggedNearTier == null || lastLoggedNearTier != nearNow) {
+              if (lastLoggedNearTier == null || Math.abs(levelCount - lastTierChangeFrame) >= 30) {
+                lastLoggedNearTier = nearNow;
+                lastTierChangeFrame = levelCount;
+                double snr = (double) cachedSpeech / Math.max(1, cachedFloor);
+                event(
+                    "统一自适应定稿：当前 10s 滑动窗 P80=%d, P10=%d, SNR=%.1fx → 激活「%s」",
+                    cachedSpeech,
+                    cachedFloor,
+                    snr,
+                    nearNow
+                        ? "⚡近场按句灵敏定稿档 (≥3.5s语音+600ms停顿 / 15s兜底)"
+                        : "🛡️远场长上下文抗噪档 (15s窗口 / ≥1.8s长停顿)");
+              }
+            }
+          }
           if (cur.flushAfterMs > 0
               && silentFrames > 0
               && !flushedThisPause
@@ -548,16 +569,24 @@ public final class RotatingLiveTranscriber implements AutoCloseable {
               && !(cur.manualVad && pending != null)) {
             boolean doFlush;
             long now = streamPosMs.get();
+            boolean nearClean = cfg.unifiedAdaptive && isNearFieldCleanWindow();
             synchronized (lock) {
               long segStart = Math.max(cur.audioStartStreamMs,
                   Math.max(cur.lastFlushStreamMs, cur.lastFinalStreamMs));
               long seg = now - segStart;
               int needed = seg < 2 * cur.flushAfterMs ? silenceFramesNeeded
                   : seg < 3 * cur.flushAfterMs ? Math.max(1, silenceFramesNeeded - 1) : 1;
-              doFlush = !cur.awaitingManualRestart
-                  && !cur.pendingText.isBlank()
-                  && seg >= cur.flushAfterMs
-                  && silentFrames >= needed;
+              boolean baseReady = !cur.awaitingManualRestart && !cur.pendingText.isBlank();
+              if (cfg.unifiedAdaptive) {
+                boolean windowFlush = seg >= cur.flushAfterMs && silentFrames >= needed;
+                boolean dynamicSentenceFlush =
+                    nearClean
+                        ? (seg >= 3_500 && silentFrames >= 6)
+                        : (seg >= 6_000 && silentFrames >= 18);
+                doFlush = baseReady && (dynamicSentenceFlush || windowFlush);
+              } else {
+                doFlush = baseReady && seg >= cur.flushAfterMs && silentFrames >= needed;
+              }
               if (doFlush) {
                 cur.lastFlushStreamMs = now;
                 cur.flushes++;
@@ -1461,21 +1490,31 @@ public final class RotatingLiveTranscriber implements AutoCloseable {
   private final int[] levelRing = new int[100];
   private int levelCount = 0;
   private int cachedThreshold = -1;
+  private int cachedFloor = 100;
+  private int cachedSpeech = 1000;
+  private Boolean lastLoggedNearTier = null;
+  private int lastTierChangeFrame = 0;
   private boolean flushedThisPause = false;
+
+  private boolean isNearFieldCleanWindow() {
+    double snr = (double) cachedSpeech / Math.max(1, cachedFloor);
+    return levelCount >= 20 && cachedSpeech >= 1350 && snr >= 4.5;
+  }
 
   private int silenceThreshold(int level) {
     levelRing[levelCount % levelRing.length] = level;
     levelCount++;
-    if (!cfg.adaptiveSilence) {
-      return cfg.silenceRms;
-    }
     if (cachedThreshold < 0 || levelCount % 10 == 0) {
       int n = Math.min(levelCount, levelRing.length);
       int[] s = Arrays.copyOf(levelRing, n);
       Arrays.sort(s);
-      int floor = s[(int) (0.10 * (n - 1))];
-      int speech = s[(int) (0.80 * (n - 1))];
-      cachedThreshold = Math.max(cfg.silenceRms, floor + (int) (0.15 * Math.max(0, speech - floor)));
+      cachedFloor = s[(int) (0.10 * (n - 1))];
+      cachedSpeech = s[(int) (0.80 * (n - 1))];
+      cachedThreshold =
+          Math.max(cfg.silenceRms, cachedFloor + (int) (0.15 * Math.max(0, cachedSpeech - cachedFloor)));
+    }
+    if (!cfg.adaptiveSilence) {
+      return cfg.silenceRms;
     }
     return cachedThreshold;
   }

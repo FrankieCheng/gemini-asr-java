@@ -114,12 +114,16 @@ public final class RotatingLiveTranscriberDemo {
           || a.equals("--far-field")
           || a.equals("--far-field=true")) {
         b.farFieldMode();
+      } else if (a.startsWith("--lang=")) {
+        b.languageCodes(List.of(v.split(",")));
       } else if (a.equals("--universal15s") || a.equals("--universal15s=true")) {
         b.universalFarField15s();
       } else if (a.equals("--tolerantAutoVad") || a.equals("--tolerantAutoVad=true")) {
         b.tolerantAutoVadMode();
       } else if (a.equals("--autoField") || a.equals("--autoField=true")) {
         b.autoFieldMode();
+      } else if (a.equals("--unifiedAdaptive") || a.equals("--unifiedAdaptive=true")) {
+        b.unifiedAdaptiveMode();
       }
     }
     LiveTranscriptionConfig cfg = b.build();
@@ -185,11 +189,13 @@ public final class RotatingLiveTranscriberDemo {
         };
 
     String modeLabel =
-        cfg.autoFieldDetect
-            ? "AutoField(3s声学探针+服务端反馈)"
-            : cfg.manualVad
-                ? (cfg.flushAfterMs == 15_000 ? "UniversalFar15s(manualVad+15s)" : "FarField(manualVad+MBB)")
-                : (cfg.officialFirst ? "MethodC(officialFirst)" : "MethodB(legacy)");
+        cfg.unifiedAdaptive
+            ? "UnifiedAdaptive(manualVad+实时SNR双档动态定稿)"
+            : cfg.autoFieldDetect
+                ? "AutoField(3s声学探针+服务端反馈)"
+                : cfg.manualVad
+                    ? (cfg.flushAfterMs == 15_000 ? "UniversalFar15s(manualVad+15s)" : "FarField(manualVad+MBB)")
+                    : (cfg.officialFirst ? "MethodC(officialFirst)" : "MethodB(legacy)");
     System.out.printf(
         Locale.ROOT,
         "模式=%s 模型=%s 音频=%s (offset=%ds, len=%.1fs) manualVad=%s rotateAfter=%ds flushAfter=%ds"

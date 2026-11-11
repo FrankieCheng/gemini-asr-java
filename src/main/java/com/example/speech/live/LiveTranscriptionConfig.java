@@ -182,6 +182,14 @@ public final class LiveTranscriptionConfig {
    * {@code manualVad = true} 并从环形缓冲区无损回放未定稿音频。
    */
   public final boolean autoFieldDetect;
+  /**
+   * 是否开启「单一全场景自适应定稿模式」（{@code manualVad = true} + 实时滑动窗口 SNR 双档动态定稿）：
+   * 底层固定 {@code manualVad = true} 彻底杜绝远场吞字且无需跨连接重建；
+   * 上层根据最近 10s 滑动窗口的实时声学信噪比（{@code P80} 与 {@code SNR = P80/P10}）动态切换定稿节奏：
+   * 近场高信噪比时遇到自然句间停顿（≥600ms，已说 ≥3.0s）即刻定稿出 Final；
+   * 远场低信噪比时屏蔽短停顿误切，攒满 15s 窗口或遇到 ≥1.5s 明确话轮交替停顿时定稿。
+   */
+  public final boolean unifiedAdaptive;
 
   private LiveTranscriptionConfig(Builder b) {
     this.project = Objects.requireNonNull(b.project, "project");
@@ -213,6 +221,7 @@ public final class LiveTranscriptionConfig {
     this.officialFirst = b.officialFirst;
     this.preferServerCutoverMs = b.preferServerCutoverMs;
     this.autoFieldDetect = b.autoFieldDetect;
+    this.unifiedAdaptive = b.unifiedAdaptive;
     if (rotateAfterMs < 15_000 || rotateAfterMs > 540_000) {
       throw new IllegalArgumentException("rotateAfterMs 应在 15s~540s 之间（服务端约 560s 发 GoAway）");
     }
@@ -250,6 +259,7 @@ public final class LiveTranscriptionConfig {
     b.officialFirst = this.officialFirst;
     b.preferServerCutoverMs = this.preferServerCutoverMs;
     b.autoFieldDetect = this.autoFieldDetect;
+    b.unifiedAdaptive = this.unifiedAdaptive;
     return new LiveTranscriptionConfig(b);
   }
 
@@ -282,17 +292,17 @@ public final class LiveTranscriptionConfig {
     private final List<String> languageCodes = new ArrayList<>();
     private final List<String> customVocabulary = new ArrayList<>();
     private boolean interimTimestamps = true;
-    private boolean manualVad = false;
+    private boolean manualVad = true;
     private StartSensitivity startOfSpeechSensitivity = StartSensitivity.DEFAULT;
     private EndSensitivity endOfSpeechSensitivity = EndSensitivity.DEFAULT;
     private int silenceDurationMs = DEFAULT_SILENCE_DURATION_MS;
     private int prefixPaddingMs = -1;
     private long rotateAfterMs = 480_000;
-    private long stallMs = 35_000;
-    private long flushAfterMs = 24_000;
+    private long stallMs = 60_000;
+    private long flushAfterMs = 15_000;
     private int silenceRms = 300;
     private boolean adaptiveSilence = true;
-    private long silenceMs = 300;
+    private long silenceMs = 250;
     private long maxCutWaitMs = 20_000;
     private long overlapMs = 2_000;
     private long tailReplayMs = DEFAULT_TAIL_REPLAY_MS;
@@ -304,6 +314,7 @@ public final class LiveTranscriptionConfig {
     private boolean officialFirst = true;
     private long preferServerCutoverMs = 12_000;
     private boolean autoFieldDetect = false;
+    private boolean unifiedAdaptive = true;
 
     public Builder project(String v) {
       project = v;
@@ -344,6 +355,9 @@ public final class LiveTranscriptionConfig {
 
     public Builder manualVad(boolean v) {
       manualVad = v;
+      if (!v) {
+        unifiedAdaptive = false;
+      }
       return this;
     }
 
@@ -452,10 +466,16 @@ public final class LiveTranscriptionConfig {
       return this;
     }
 
+    public Builder unifiedAdaptive(boolean v) {
+      unifiedAdaptive = v;
+      return this;
+    }
+
     /** 一键配置 Method C（官方 ADK 优先 + Make-Before-Break 兜底 + 24s 长独白安全阀）。 */
     public Builder methodCOfficialFirst() {
       this.manualVad = false;
       this.autoFieldDetect = false;
+      this.unifiedAdaptive = false;
       this.officialFirst = true;
       this.preferServerCutoverMs = 12_000;
       this.flushAfterMs = 24_000;
@@ -478,6 +498,7 @@ public final class LiveTranscriptionConfig {
     public Builder farFieldMode() {
       this.manualVad = true;
       this.autoFieldDetect = false;
+      this.unifiedAdaptive = false;
       this.officialFirst = true;
       this.flushAfterMs = DEFAULT_FAR_FIELD_FLUSH_MS;
       this.stallMs = 90_000;
@@ -492,6 +513,7 @@ public final class LiveTranscriptionConfig {
     public Builder universalFarField15s() {
       this.manualVad = true;
       this.autoFieldDetect = false;
+      this.unifiedAdaptive = false;
       this.officialFirst = true;
       this.flushAfterMs = 15_000;
       this.silenceMs = 250;
@@ -507,6 +529,7 @@ public final class LiveTranscriptionConfig {
     public Builder tolerantAutoVadMode() {
       this.manualVad = false;
       this.autoFieldDetect = false;
+      this.unifiedAdaptive = false;
       this.officialFirst = true;
       this.startOfSpeechSensitivity = StartSensitivity.HIGH;
       this.endOfSpeechSensitivity = EndSensitivity.LOW;
@@ -530,10 +553,34 @@ public final class LiveTranscriptionConfig {
       return this;
     }
 
+    /**
+     * 统一全场景自适应模式（{@code unifiedAdaptive = true}）：
+     * 底层固定 {@code manualVad = true}（100% 杜绝远场吞字，同一场会议内近场/远场说话人交替也无需重连 WebSocket）；
+     * 上层由客户端根据最近 10s 滑动窗口的实时声学信噪比（{@code P80} 与 {@code SNR = P80/P10}）动态切换定稿节奏：
+     * <ul>
+     *   <li><b>近场高信噪比档</b>（{@code P80 >= 1350 && SNR >= 4.5x}）：说话满 3.0s 且停顿 ≥600ms 即刻按句定稿出 Final，
+     *       连续快语速满 15s 且微停顿 ≥250ms 兜底定稿；</li>
+     *   <li><b>远场低信噪比抗噪档</b>（{@code P80 < 1350 || SNR < 4.5x}）：屏蔽短停顿防切碎，攒满 15s 且微停顿 ≥250ms
+     *       （或遇到 ≥1.8s 明确话轮交替停顿且已说满 5s）定稿出 Final。</li>
+     * </ul>
+     */
+    public Builder unifiedAdaptiveMode() {
+      this.manualVad = true;
+      this.autoFieldDetect = false;
+      this.unifiedAdaptive = true;
+      this.officialFirst = true;
+      this.flushAfterMs = 15_000;
+      this.silenceMs = 250;
+      this.stallMs = 60_000;
+      this.maxReplayMs = 60_000;
+      return this;
+    }
+
     /** 一键配置传统 Method B（客户端 8s 高频自适应软刷 + 客户端静音抢切 + 60s 重放）。 */
     public Builder legacyMethodB() {
       this.officialFirst = false;
       this.autoFieldDetect = false;
+      this.unifiedAdaptive = false;
       this.preferServerCutoverMs = 0;
       this.flushAfterMs = 8_000;
       this.maxReplayMs = 60_000;
