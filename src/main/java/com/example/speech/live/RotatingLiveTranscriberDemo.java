@@ -53,6 +53,8 @@ public final class RotatingLiveTranscriberDemo {
     String audio = "test_video_630s.wav";
     String name = "live_demo";
     int killAtSec = -1;
+    int startSec = 0;
+    int maxSec = -1;
     LiveTranscriptionConfig.Builder b =
         LiveTranscriptionConfig.builder()
             .project(System.getenv().getOrDefault("GOOGLE_CLOUD_PROJECT", "cloud-llm-preview1"))
@@ -65,6 +67,10 @@ public final class RotatingLiveTranscriberDemo {
         name = v;
       } else if (a.startsWith("--killAtSec=")) {
         killAtSec = Integer.parseInt(v);
+      } else if (a.startsWith("--startSec=")) {
+        startSec = Integer.parseInt(v);
+      } else if (a.startsWith("--maxSec=")) {
+        maxSec = Integer.parseInt(v);
       } else if (a.startsWith("--model=")) {
         b.model(v);
       } else if (a.startsWith("--rotateAfterSec=")) {
@@ -79,6 +85,41 @@ public final class RotatingLiveTranscriberDemo {
         b.adaptiveSilence(Boolean.parseBoolean(v));
       } else if (a.startsWith("--maxCutWaitSec=")) {
         b.maxCutWaitMs(Long.parseLong(v) * 1000);
+      } else if (a.startsWith("--silenceDurationMs=")) {
+        b.silenceDurationMs(Integer.parseInt(v));
+      } else if (a.startsWith("--prefixPaddingMs=")) {
+        b.prefixPaddingMs(Integer.parseInt(v));
+      } else if (a.startsWith("--startSensitivity=")) {
+        b.startOfSpeechSensitivity(LiveTranscriptionConfig.StartSensitivity.parse(v));
+      } else if (a.startsWith("--endSensitivity=")) {
+        b.endOfSpeechSensitivity(LiveTranscriptionConfig.EndSensitivity.parse(v));
+      } else if (a.startsWith("--manualVad=")) {
+        b.manualVad(Boolean.parseBoolean(v));
+      } else if (a.startsWith("--tailReplayMs=")) {
+        b.tailReplayMs(Long.parseLong(v));
+      } else if (a.startsWith("--officialFirst=")) {
+        b.officialFirst(Boolean.parseBoolean(v));
+      } else if (a.startsWith("--project=")) {
+        b.project(v);
+      } else if (a.startsWith("--location=")) {
+        b.location(v);
+      } else if (a.startsWith("--preferServerCutSec=")) {
+        b.preferServerCutoverMs(Long.parseLong(v) * 1000);
+      } else if (a.equals("--legacyMethodB") || a.equals("--legacyMethodB=true")) {
+        b.legacyMethodB();
+      } else if (a.equals("--methodC") || a.equals("--methodC=true")) {
+        b.methodCOfficialFirst();
+      } else if (a.equals("--farField")
+          || a.equals("--farField=true")
+          || a.equals("--far-field")
+          || a.equals("--far-field=true")) {
+        b.farFieldMode();
+      } else if (a.equals("--universal15s") || a.equals("--universal15s=true")) {
+        b.universalFarField15s();
+      } else if (a.equals("--tolerantAutoVad") || a.equals("--tolerantAutoVad=true")) {
+        b.tolerantAutoVadMode();
+      } else if (a.equals("--autoField") || a.equals("--autoField=true")) {
+        b.autoFieldMode();
       }
     }
     LiveTranscriptionConfig cfg = b.build();
@@ -92,12 +133,14 @@ public final class RotatingLiveTranscriberDemo {
       }
       pcm = in.readAllBytes();
     }
-    for (String a : args) {
-      if (a.startsWith("--maxSec=")) {
-        int maxBytes = Integer.parseInt(a.substring(9)) * 32000;
-        if (pcm.length > maxBytes) {
-          pcm = java.util.Arrays.copyOf(pcm, maxBytes);
-        }
+    if (startSec > 0) {
+      int startBytes = Math.min(pcm.length, startSec * 32000);
+      pcm = java.util.Arrays.copyOfRange(pcm, startBytes, pcm.length);
+    }
+    if (maxSec > 0) {
+      int maxBytes = maxSec * 32000;
+      if (pcm.length > maxBytes) {
+        pcm = java.util.Arrays.copyOf(pcm, maxBytes);
       }
     }
 
@@ -141,10 +184,34 @@ public final class RotatingLiveTranscriberDemo {
           }
         };
 
-    System.out.printf(Locale.ROOT, "模型=%s 音频=%s (%.1fs) rotateAfter=%ds stall=%ds%n", cfg.model,
-        audio, pcm.length / 32000.0, cfg.rotateAfterMs / 1000, cfg.stallMs / 1000);
+    String modeLabel =
+        cfg.autoFieldDetect
+            ? "AutoField(3s声学探针+服务端反馈)"
+            : cfg.manualVad
+                ? (cfg.flushAfterMs == 15_000 ? "UniversalFar15s(manualVad+15s)" : "FarField(manualVad+MBB)")
+                : (cfg.officialFirst ? "MethodC(officialFirst)" : "MethodB(legacy)");
+    System.out.printf(
+        Locale.ROOT,
+        "模式=%s 模型=%s 音频=%s (offset=%ds, len=%.1fs) manualVad=%s rotateAfter=%ds flushAfter=%ds"
+            + " preferServerCut=%ds silenceDurationMs=%d SOS=%s EOS=%s tailReplayMs=%d%n",
+        modeLabel,
+        cfg.model,
+        audio,
+        startSec,
+        pcm.length / 32000.0,
+        cfg.manualVad,
+        cfg.rotateAfterMs / 1000,
+        cfg.flushAfterMs / 1000,
+        cfg.preferServerCutoverMs / 1000,
+        cfg.silenceDurationMs,
+        cfg.startOfSpeechSensitivity,
+        cfg.endOfSpeechSensitivity,
+        cfg.effectiveTailReplayMs());
 
     List<RotatingLiveTranscriber.SessionInfo> infos;
+    int serverFinals;
+    int officialCleanCuts;
+    int fallbackCuts;
     try (RotatingLiveTranscriber t = new RotatingLiveTranscriber(cfg, listener)) {
       t.start();
       int frame = 3200; // 100ms
@@ -164,11 +231,21 @@ public final class RotatingLiveTranscriberDemo {
       }
       t.finish();
       infos = t.sessionInfos();
+      serverFinals = t.serverNaturalFinalsCount();
+      officialCleanCuts = t.officialCleanCutCount();
+      fallbackCuts = t.fallbackCutCount();
     }
 
     StringBuilder tsv = new StringBuilder();
     tsv.append("# session\taudio_start_s\taudio_end_s\tend_reason\tgoaway\tfinals\ttext\n");
     System.out.println("\n================ 会话汇总 ================");
+    System.out.printf(
+        Locale.ROOT,
+        "总 Final=%d (服务端原生=%d)  官方句末零排空切流=%d  声学/重叠兜底切流=%d%n",
+        finals.size(),
+        serverFinals,
+        officialCleanCuts,
+        fallbackCuts);
     for (RotatingLiveTranscriber.SessionInfo s : infos) {
       String line =
           String.format(Locale.ROOT, "S%d\t%.1f\t%.1f\t%s\t%s\t%d\t%s", s.index,
