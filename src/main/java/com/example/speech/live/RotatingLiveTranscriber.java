@@ -638,8 +638,9 @@ public final class RotatingLiveTranscriber implements AutoCloseable {
               cutHow = "auto_far_field";
             } else if (cfg.officialFirst) {
               // Method C（官方优先）：自动 VAD 下在 preferServerCutoverMs（默认 12s）内优先认官方 !cur.pending() 句末切点；
-              // 若开启 manualVad（服务端不会自动断句）或超出等待窗口 / GoAway 紧急，则在客户端微停顿时立即无盲区切流。
-              if (officialNotPending) {
+              // 若开启 manualVad（服务端不会自动断句，切流时必须调 startDrain 发 activityEnd 落定）或超出等待窗口 / GoAway 紧急，
+              // 则在客户端微停顿时无盲区切流并后台排空旧会话。
+              if (!cur.manualVad && officialNotPending) {
                 cutHow = "official_gap";
               } else if ((cur.manualVad || waited >= cfg.preferServerCutoverMs || goAwayUrgent)
                   && clientSilence) {
@@ -649,7 +650,7 @@ public final class RotatingLiveTranscriber implements AutoCloseable {
               }
             } else {
               // Method B（传统模式）：客户端 300ms 低 RMS 与服务端句末并列抢切
-              if (officialNotPending && silentFrames >= 1) {
+              if (!cur.manualVad && officialNotPending && silentFrames >= 1) {
                 cutHow = "official_gap";
               } else if (clientSilence) {
                 cutHow = "silence";
@@ -1004,9 +1005,10 @@ public final class RotatingLiveTranscriber implements AutoCloseable {
           lastActivity = Math.max(s.lastFinalWallMs, s.lastServerMessageWallMs);
         }
         long elapsed = now - t0;
+        long minQuietElapsed = Math.max(cfg.drainQuietMs, s.manualVad ? 1_500L : 600L);
         boolean quiet =
-            elapsed >= Math.max(cfg.drainQuietMs, 600L)
-                && now - Math.max(lastActivity, t0) >= cfg.drainQuietMs;
+            elapsed >= minQuietElapsed
+                && now - Math.max(lastActivity, t0) >= (s.manualVad ? Math.max(cfg.drainQuietMs, 1_200L) : cfg.drainQuietMs);
         if (s.ws.isDead()
             || elapsed >= cfg.drainMaxMs
             || (!pendingInterim && (genDone || quiet))) {
